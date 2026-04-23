@@ -1,0 +1,179 @@
+DS644 Project - Flight Data Analysis
+------------------------------------
+Instance Information: AWS EC2 (1 Master + 5 Workers)
+OS: Ubuntu 22.04 LTS
+Type: t3.Large
+Storage: 30GB gp3
+
+################################################################
+# PHASE 1: CLUSTER ENVIRONMENT SETUP (Master Node)
+################################################################
+
+1) Install Dependencies (Java 8 & Hadoop 3.3.6):
+$ sudo apt update && sudo apt install openjdk-8-jdk -y
+$ wget https://downloads.apache.org/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz
+$ tar -xzvf hadoop-3.3.6.tar.gz
+$ sudo mv hadoop-3.3.6 /usr/local/hadoop
+
+2) Configure Environment Variables (.bashrc):
+export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+export HADOOP_HOME=/usr/local/hadoop
+export PATH=$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin
+export HADOOP_CONF_DIR=$HADOOP_HOME/etc/hadoop
+
+3) Apply Configuration:
+$ source ~/.bashrc
+$ echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" | sudo tee -a /usr/local/hadoop/etc/hadoop/hadoop-env.sh
+
+4) Start Hadoop Services:
+$ start-dfs.sh
+$ start-yarn.sh
+
+################################################################
+# PHASE 2: DATA ACQUISITION (VIA PUBLIC S3 BUCKET)
+################################################################
+
+5) Download Dataset from S3 (Public Bucket Method):
+# Files were uploaded to s3://mybucket1234 and made public
+$ mkdir -p ~/airline_data
+$ cd ~/airline_data
+$ for year in {1987..2008}; do
+wget "https://mybucket1234.s3.us-east-1.amazonaws.com/$year.csv.bz2"
+done
+
+6) Upload Data to HDFS:
+$ hdfs dfs -mkdir -p /user/ubuntu/input
+$ hdfs dfs -put ~/airline_data/*.bz2 /user/ubuntu/input/
+
+################################################################
+# PHASE 3: JAVA CODE COMPILATION
+################################################################
+
+7) Create Source Directory and Compile:
+$ mkdir -p ~/airline_jobs/src
+$ cd ~/airline_jobs/src
+# (Ensure OnTimeProbability.java, TaxiTimePerAirport.java, CancellationReason.java, AverageDistance.java are present)
+$ mkdir -p ../classes
+$ javac -classpath `hadoop classpath` -d ../classes *.java
+
+8) Create Executable JAR:
+$ cd ../classes
+$ jar -cvf airline.jar .
+
+################################################################
+# PHASE 4: FINAL FILE STRUCTURE
+################################################################
+
+9) Verify the directory structure on Master Node:
+/home/ubuntu/
+├── airline_data/ # Local storage for downloaded .bz2 files
+│ ├── 1987.csv.bz2
+│ └── ... (up to 2008)
+├── airline_jobs/
+│ ├── src/ # Java Source Code
+│ │ ├── AverageDistance.java
+│ │ ├── CancellationReason.java
+│ │ ├── OnTimeProbability.java
+│ │ └── TaxiTimePerAirport.java
+│ └── classes/ # Compiled Bytecode & JAR
+│ ├── airline.jar <-- The final executable JAR
+│ └── *.class files
+└── run_workflow.sh <-- The automation script
+
+################################################################
+# PHASE 5: PROJECT EXECUTION (SHELL WORKFLOW)
+################################################################
+
+10) Create the Workflow Script (run_workflow.sh):
+$ nano ~/run_workflow.sh
+
+
+
+#!/bin/bash
+
+# --- CONFIGURATION: SET OUTPUT FOLDER FOR TIME ANALYSIS ---
+OUTPUT_DIR_SUFFIX="_6nodes"
+
+# Base input and output paths
+HDFS_INPUT="/user/ubuntu/input"
+HDFS_OUTPUT="/user/ubuntu/output"
+
+echo "========================================================================="
+echo " FLIGHT DATA ANALYSIS: SHELL SCRIPT WORKFLOW (6-NODE CLUSTER EXECUTION) "
+echo "========================================================================="
+echo ""
+echo "Starting 4 sequential MapReduce Jobs. Execution time will be measured."
+
+# 1. CLEAN OUTPUT: Clear all previous output directories for this run
+echo ">>> STEP 1: Cleaning previous output directories..."
+hdfs dfs -rm -r ${HDFS_OUTPUT}/ontime${OUTPUT_DIR_SUFFIX}
+hdfs dfs -rm -r ${HDFS_OUTPUT}/taxi${OUTPUT_DIR_SUFFIX}
+hdfs dfs -rm -r ${HDFS_OUTPUT}/cancel${OUTPUT_DIR_SUFFIX}
+hdfs dfs -rm -r ${HDFS_OUTPUT}/distance${OUTPUT_DIR_SUFFIX}
+echo "Cleanup complete."
+
+# 2. JOB EXECUTION & TIMING: Run all four independent jobs sequentially
+
+# Job 1: On-Time Probability (Probability of being on schedule)
+echo ""
+echo ">>> STEP 2A: Running Job 1 (OnTimeProbability)..."
+time hadoop jar ~/airline_jobs/classes/airline.jar OnTimeProbability ${HDFS_INPUT} ${HDFS_OUTPUT}/ontime${OUTPUT_DIR_SUFFIX}
+
+# Job 2: Taxi Time (Average Taxi Time per Airport)
+echo ""
+echo ">>> STEP 2B: Running Job 2 (TaxiTimePerAirport)..."
+time hadoop jar ~/airline_jobs/classes/airline.jar TaxiTimePerAirport ${HDFS_INPUT} ${HDFS_OUTPUT}/taxi${OUTPUT_DIR_SUFFIX}
+
+# Job 3: Cancellation Reason (Count of A, B, C, D codes)
+echo ""
+echo ">>> STEP 2C: Running Job 3 (CancellationReason)..."
+time hadoop jar ~/airline_jobs/classes/airline.jar CancellationReason ${HDFS_INPUT} ${HDFS_OUTPUT}/cancel${OUTPUT_DIR_SUFFIX}
+
+# Job 4: Average Distance (Top 3 Longest Routes)
+echo ""
+echo ">>> STEP 2D: Running Job 4 (AverageDistance)..."
+time hadoop jar ~/airline_jobs/classes/airline.jar AverageDistance ${HDFS_INPUT} ${HDFS_OUTPUT}/distance${OUTPUT_DIR_SUFFIX}
+
+# 3. VERIFICATION & REPORT GENERATION
+echo ""
+echo ">>> STEP 3: Workflow complete. Generating Final Report..."
+
+(
+echo "==========================================="
+echo " FLIGHT DATA ANALYSIS REPORT "
+echo "==========================================="
+echo ""
+echo "--- 1. Top 3 Airlines (Highest On-Time Probability) ---"
+hdfs dfs -cat ${HDFS_OUTPUT}/ontime${OUTPUT_DIR_SUFFIX}/part-r-00000 | sort -k2 -nr | head -n 3
+echo ""
+echo "--- 2. Bottom 3 Airlines (Lowest On-Time Probability) ---"
+hdfs dfs -cat ${HDFS_OUTPUT}/ontime${OUTPUT_DIR_SUFFIX}/part-r-00000 | sort -k2 -n | head -n 3
+echo ""
+echo "--- 3. Top 3 Longest Average Routes (Airline/Origin/Dest) ---"
+# This output is already sorted by the Java Reducer, grep removes the header artifact
+hdfs dfs -cat ${HDFS_OUTPUT}/distance${OUTPUT_DIR_SUFFIX}/part-r-00000 | grep -v "0.0" | head -n 4
+echo ""
+echo "--- 4. Top 5 Airports with Longest Taxi Times ---"
+hdfs dfs -cat ${HDFS_OUTPUT}/taxi${OUTPUT_DIR_SUFFIX}/part-r-00000 | sort -k2 -nr | head -n 5
+echo ""
+echo "--- 5. Top 5 Airports with Shortest Taxi Times ---"
+hdfs dfs -cat ${HDFS_OUTPUT}/taxi${OUTPUT_DIR_SUFFIX}/part-r-00000 | sort -k2 -n | head -n 5
+echo ""
+echo "--- 6. Cancellation Reasons ---"
+hdfs dfs -cat ${HDFS_OUTPUT}/cancel${OUTPUT_DIR_SUFFIX}/part-r-00000
+) > final_report.txt
+
+# Display the report to the console
+cat final_report.txt
+
+
+Save the file . and then run this 
+
+
+$ chmod +x ~/run_workflow.sh
+
+11) Run the Final Project Workflow:
+$ ./run_workflow.sh
+
+12) View Final Reports (Generated by the script):
+$ cat final_project_report.txt
